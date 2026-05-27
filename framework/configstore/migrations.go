@@ -567,6 +567,9 @@ func triggerMigrations(ctx context.Context, db *gorm.DB) error {
 	if err := migrationAddRateLimitToTeamsAndCustomers(ctx, db); err != nil {
 		return err
 	}
+	if err := migrationAddRateLimitOwnerColumns(ctx, db); err != nil {
+		return err
+	}
 	if err := migrationAddAsyncJobResultTTLColumn(ctx, db); err != nil {
 		return err
 	}
@@ -4582,6 +4585,112 @@ func migrationAddRateLimitToTeamsAndCustomers(ctx context.Context, db *gorm.DB) 
 	}})
 	if err := m.Migrate(); err != nil {
 		return fmt.Errorf("error running rate limit migration for teams and customers: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationAddRateLimitOwnerColumns adds owner-scope foreign key columns to governance_rate_limits
+// and backfills them from the owning tables so existing rows keep their scope.
+func migrationAddRateLimitOwnerColumns(ctx context.Context, db *gorm.DB) error {
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: "add_rate_limit_owner_columns",
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			migrator := tx.Migrator()
+
+			type columnSpec struct {
+				fieldName string
+				columnName string
+				indexName  string
+			}
+			specs := []columnSpec{
+				{fieldName: "VirtualKeyID", columnName: "virtual_key_id", indexName: "idx_governance_rate_limits_virtual_key_id"},
+				{fieldName: "TeamID", columnName: "team_id", indexName: "idx_governance_rate_limits_team_id"},
+				{fieldName: "CustomerID", columnName: "customer_id", indexName: "idx_governance_rate_limits_customer_id"},
+				{fieldName: "ProviderConfigID", columnName: "provider_config_id", indexName: "idx_governance_rate_limits_provider_config_id"},
+			}
+
+			for _, spec := range specs {
+				if !migrator.HasColumn(&tables.TableRateLimit{}, spec.columnName) {
+					if err := migrator.AddColumn(&tables.TableRateLimit{}, spec.fieldName); err != nil {
+						return fmt.Errorf("failed to add %s column to governance_rate_limits: %w", spec.columnName, err)
+					}
+				}
+				if !migrator.HasIndex(&tables.TableRateLimit{}, spec.indexName) {
+					if err := migrator.CreateIndex(&tables.TableRateLimit{}, spec.fieldName); err != nil {
+						return fmt.Errorf("failed to create index on governance_rate_limits.%s: %w", spec.columnName, err)
+					}
+				}
+			}
+
+			backfillStatements := []struct {
+				stmt string
+				err  string
+			}{
+				{
+					stmt: `UPDATE governance_rate_limits SET virtual_key_id = (
+						SELECT id FROM governance_virtual_keys WHERE governance_virtual_keys.rate_limit_id = governance_rate_limits.id
+					) WHERE virtual_key_id IS NULL AND EXISTS (
+						SELECT 1 FROM governance_virtual_keys WHERE governance_virtual_keys.rate_limit_id = governance_rate_limits.id
+					)`,
+					err:  "virtual_key_id",
+				},
+				{
+					stmt: `UPDATE governance_rate_limits SET team_id = (
+						SELECT id FROM governance_teams WHERE governance_teams.rate_limit_id = governance_rate_limits.id
+					) WHERE team_id IS NULL AND EXISTS (
+						SELECT 1 FROM governance_teams WHERE governance_teams.rate_limit_id = governance_rate_limits.id
+					)`,
+					err:  "team_id",
+				},
+				{
+					stmt: `UPDATE governance_rate_limits SET customer_id = (
+						SELECT id FROM governance_customers WHERE governance_customers.rate_limit_id = governance_rate_limits.id
+					) WHERE customer_id IS NULL AND EXISTS (
+						SELECT 1 FROM governance_customers WHERE governance_customers.rate_limit_id = governance_rate_limits.id
+					)`,
+					err:  "customer_id",
+				},
+				{
+					stmt: `UPDATE governance_rate_limits SET provider_config_id = (
+						SELECT id FROM governance_virtual_key_provider_configs WHERE governance_virtual_key_provider_configs.rate_limit_id = governance_rate_limits.id
+					) WHERE provider_config_id IS NULL AND EXISTS (
+						SELECT 1 FROM governance_virtual_key_provider_configs WHERE governance_virtual_key_provider_configs.rate_limit_id = governance_rate_limits.id
+					)`,
+					err:  "provider_config_id",
+				},
+			}
+			for _, backfill := range backfillStatements {
+				if err := tx.Exec(backfill.stmt).Error; err != nil {
+					return fmt.Errorf("failed to backfill %s on governance_rate_limits: %w", backfill.err, err)
+				}
+			}
+
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			migrator := tx.Migrator()
+			for _, indexName := range []string{
+				"idx_governance_rate_limits_virtual_key_id",
+				"idx_governance_rate_limits_team_id",
+				"idx_governance_rate_limits_customer_id",
+				"idx_governance_rate_limits_provider_config_id",
+			} {
+				_ = tx.Exec(fmt.Sprintf("DROP INDEX IF EXISTS %s", indexName)).Error
+			}
+			for _, columnName := range []string{"virtual_key_id", "team_id", "customer_id", "provider_config_id"} {
+				if migrator.HasColumn(&tables.TableRateLimit{}, columnName) {
+					if err := migrator.DropColumn(&tables.TableRateLimit{}, columnName); err != nil {
+						return fmt.Errorf("failed to drop %s column from governance_rate_limits: %w", columnName, err)
+					}
+				}
+			}
+			return nil
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running rate limit owner columns migration: %s", err.Error())
 	}
 	return nil
 }

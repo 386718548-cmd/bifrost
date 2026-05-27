@@ -99,6 +99,22 @@ type BudgetAndRateLimitStatus struct {
 type GovernanceStore interface {
 	GetGovernanceData(ctx context.Context) *GovernanceData
 	GetVirtualKey(ctx context.Context, vkValue string) (*configstoreTables.TableVirtualKey, bool)
+	// EachBudget calls fn for every budget loaded in memory. Used by the
+	// consumer to evaluate thresholds after usage updates.
+	// EachBudget calls fn for every budget loaded in memory, passing the
+	// owner scope type and ID derived from the budget's FK columns.
+	// ownerScopeType is one of "virtual_key", "team", "customer", "provider", or "global".
+	EachBudget(fn func(budgetID string, currentUsage, maxLimit float64, ownerScopeType, ownerScopeID string))
+	// EachRateLimit calls fn for every rate limit loaded in memory, passing the
+	// owner scope type and ID derived from the rate limit's FK columns.
+	// ownerScopeType is one of "virtual_key", "team", "customer", or "global".
+	EachRateLimit(fn func(rateLimitID string, tokenCurrentUsage, tokenMaxLimit int64, ownerScopeType, ownerScopeID string))
+	// EachRequestLimit calls fn for every rate limit that has a request-limit configured,
+	// passing the owner scope type and ID derived from the rate limit's FK columns.
+	// This is separate from EachRateLimit because request limits and token limits are
+	// independent dimensions stored in the same row. A rate limit may have only request
+	// limits, only token limits, or both.
+	EachRequestLimit(fn func(rateLimitID string, requestCurrentUsage, requestMaxLimit int64, ownerScopeType, ownerScopeID string))
 	// Budget crud.
 	// UpsertBudgetConfig preserves in-memory CurrentUsage/LastReset on replacement —
 	// use it for every config publish (fresh load or admin edit) so a concurrent
@@ -1712,6 +1728,107 @@ func (gs *LocalGovernanceStore) DumpBudgets(ctx context.Context, baselines map[s
 	return nil
 }
 
+// ownerScopeFromBudget derives the alert-rule scope type and ID from a budget's FK columns.
+func ownerScopeFromBudget(b *configstoreTables.TableBudget) (scopeType, scopeID string) {
+	switch {
+	case b.VirtualKeyID != nil:
+		return "virtual_key", *b.VirtualKeyID
+	case b.TeamID != nil:
+		return "team", *b.TeamID
+	case b.CustomerID != nil:
+		return "customer", *b.CustomerID
+	case b.ProviderConfigID != nil:
+		return "provider", fmt.Sprintf("%d", *b.ProviderConfigID)
+	default:
+		return "global", ""
+	}
+}
+
+// EachBudget calls fn for every budget loaded in memory, passing owner scope info.
+func (gs *LocalGovernanceStore) EachBudget(fn func(budgetID string, currentUsage, maxLimit float64, ownerScopeType, ownerScopeID string)) {
+	gs.budgets.Range(func(key, value any) bool {
+		b, ok := value.(*configstoreTables.TableBudget)
+		if ok && b != nil {
+			scopeType, scopeID := ownerScopeFromBudget(b)
+			fn(key.(string), b.CurrentUsage, b.MaxLimit, scopeType, scopeID)
+		}
+		return true
+	})
+}
+
+// stampRateLimitOwner sets the owner-scope FK on a rate limit that has no owner
+// yet. Exactly one of vkID/teamID/customerID/providerConfigID should be non-nil.
+// Rate limits are linked from the owner side (owner.rate_limit_id), so their own
+// FK columns load as nil; ownerScopeFromRateLimit needs them populated or every
+// VK/team/customer/provider-scoped rate-limit alert is misattributed to global scope.
+func stampRateLimitOwner(rl *configstoreTables.TableRateLimit, vkID, teamID, customerID string, providerConfigID *uint) {
+	if rl == nil || rl.VirtualKeyID != nil || rl.TeamID != nil || rl.CustomerID != nil || rl.ProviderConfigID != nil {
+		return
+	}
+	switch {
+	case vkID != "":
+		rl.VirtualKeyID = &vkID
+	case teamID != "":
+		rl.TeamID = &teamID
+	case customerID != "":
+		rl.CustomerID = &customerID
+	case providerConfigID != nil:
+		rl.ProviderConfigID = providerConfigID
+	}
+}
+
+// stampBudgetCustomerOwner sets the customer owner FK on a budget that has no
+// owner yet. Customer budgets are linked via customer.budget_id, so the budget
+// row's own FK columns load as nil; ownerScopeFromBudget needs CustomerID set or
+// customer-scoped budget alerts are misattributed to global scope.
+func stampBudgetCustomerOwner(b *configstoreTables.TableBudget, customerID string) {
+	if b == nil || b.VirtualKeyID != nil || b.TeamID != nil || b.CustomerID != nil || b.ProviderConfigID != nil {
+		return
+	}
+	b.CustomerID = &customerID
+}
+
+// ownerScopeFromRateLimit derives the alert-rule scope type and ID from a rate limit's FK columns.
+func ownerScopeFromRateLimit(rl *configstoreTables.TableRateLimit) (scopeType, scopeID string) {
+	switch {
+	case rl.VirtualKeyID != nil:
+		return "virtual_key", *rl.VirtualKeyID
+	case rl.TeamID != nil:
+		return "team", *rl.TeamID
+	case rl.CustomerID != nil:
+		return "customer", *rl.CustomerID
+	case rl.ProviderConfigID != nil:
+		return "provider", fmt.Sprintf("%d", *rl.ProviderConfigID)
+	default:
+		return "global", ""
+	}
+}
+
+// EachRateLimit calls fn for every rate limit loaded in memory, passing owner scope info.
+func (gs *LocalGovernanceStore) EachRateLimit(fn func(rateLimitID string, tokenCurrentUsage, tokenMaxLimit int64, ownerScopeType, ownerScopeID string)) {
+	gs.rateLimits.Range(func(key, value any) bool {
+		rl, ok := value.(*configstoreTables.TableRateLimit)
+		if ok && rl != nil && rl.TokenMaxLimit != nil {
+			scopeType, scopeID := ownerScopeFromRateLimit(rl)
+			fn(key.(string), rl.TokenCurrentUsage, *rl.TokenMaxLimit, scopeType, scopeID)
+		}
+		return true
+	})
+}
+
+// EachRequestLimit calls fn for every rate limit that has a request-limit configured,
+// passing owner scope info.
+func (gs *LocalGovernanceStore) EachRequestLimit(fn func(rateLimitID string, requestCurrentUsage, requestMaxLimit int64, ownerScopeType, ownerScopeID string)) {
+	gs.rateLimits.Range(func(key, value any) bool {
+		rl, ok := value.(*configstoreTables.TableRateLimit)
+		if ok && rl != nil && rl.RequestMaxLimit != nil {
+			scopeType, scopeID := ownerScopeFromRateLimit(rl)
+			fn(key.(string), rl.RequestCurrentUsage, *rl.RequestMaxLimit, scopeType, scopeID)
+		}
+		return true
+	})
+}
+
 // DATABASE METHODS
 
 // loadFromDatabase loads all governance data from the database into memory
@@ -1763,6 +1880,9 @@ func (gs *LocalGovernanceStore) loadFromDatabase(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to load routing rules: %w", err)
 	}
+
+	// Back-fill owner-scope FKs before the in-memory maps are rebuilt.
+	gs.backfillOwnerScopes(virtualKeys, teams, customers, budgets, rateLimits)
 
 	// Rebuild in-memory structures (lock-free)
 	gs.rebuildInMemoryStructures(ctx, customers, teams, virtualKeys, budgets, rateLimits, modelConfigs, providers, routingRules)
@@ -1896,6 +2016,9 @@ func (gs *LocalGovernanceStore) loadFromConfigMemory(ctx context.Context, config
 		virtualKeys[i] = *vk
 	}
 
+	// Back-fill owner-scope FKs before the in-memory maps are rebuilt.
+	gs.backfillOwnerScopes(virtualKeys, teams, customers, budgets, rateLimits)
+
 	// Rebuild in-memory structures (lock-free)
 	gs.rebuildInMemoryStructures(ctx, customers, teams, virtualKeys, budgets, rateLimits, modelConfigs, providers, routingRules)
 
@@ -2028,6 +2151,89 @@ func (gs *LocalGovernanceStore) rebuildInMemoryStructures(ctx context.Context, c
 	}
 	gs.LastDBUsagesRateLimitsTokensMu.Unlock()
 	gs.LastDBUsagesRateLimitsRequestsMu.Unlock()
+}
+
+// backfillOwnerScopes sets the owner-scope foreign keys on the in-memory
+// rate-limit and budget instances that EachRateLimit/EachBudget iterate.
+// Rate limits (for VK/team/customer/provider-config) and customer budgets are
+// linked from the owner side — the owner row holds rate_limit_id / budget_id
+// — so the standalone rows load with NULL owner FKs as loaded from the DB. The
+// alert evaluator derives a rule's scope via ownerScopeFromRateLimit /
+// ownerScopeFromBudget, which read those FKs; leaving them NULL would
+// misattribute scoped alerts to global scope and never match their rules. This
+// walks the owner slices and stamps the scope onto the standalone instances
+// before they are published into the sync.Map fields.
+func (gs *LocalGovernanceStore) backfillOwnerScopes(
+	virtualKeys []configstoreTables.TableVirtualKey,
+	teams []configstoreTables.TableTeam,
+	customers []configstoreTables.TableCustomer,
+	budgets []configstoreTables.TableBudget,
+	rateLimits []configstoreTables.TableRateLimit,
+) {
+	rateLimitByID := make(map[string]*configstoreTables.TableRateLimit, len(rateLimits))
+	for i := range rateLimits {
+		rateLimit := &rateLimits[i]
+		rateLimitByID[rateLimit.ID] = rateLimit
+	}
+	budgetByID := make(map[string]*configstoreTables.TableBudget, len(budgets))
+	for i := range budgets {
+		budget := &budgets[i]
+		budgetByID[budget.ID] = budget
+	}
+	// rateLimitUnowned reports whether a rate limit has no owner FK set yet.
+	rateLimitUnowned := func(rl *configstoreTables.TableRateLimit) bool {
+		return rl != nil && rl.VirtualKeyID == nil && rl.TeamID == nil && rl.CustomerID == nil && rl.ProviderConfigID == nil
+	}
+
+	for i := range virtualKeys {
+		vk := &virtualKeys[i]
+		if vk.RateLimitID == nil {
+			continue
+		}
+		if rl := rateLimitByID[*vk.RateLimitID]; rateLimitUnowned(rl) {
+			id := vk.ID
+			rl.VirtualKeyID = &id
+		}
+	}
+	for i := range virtualKeys {
+		vk := &virtualKeys[i]
+		for j := range vk.ProviderConfigs {
+			pc := &vk.ProviderConfigs[j]
+			if pc.RateLimitID == nil {
+				continue
+			}
+			if rl := rateLimitByID[*pc.RateLimitID]; rateLimitUnowned(rl) {
+				id := pc.ID
+				rl.ProviderConfigID = &id
+			}
+		}
+	}
+	for i := range teams {
+		team := &teams[i]
+		if team.RateLimitID == nil {
+			continue
+		}
+		if rl := rateLimitByID[*team.RateLimitID]; rateLimitUnowned(rl) {
+			id := team.ID
+			rl.TeamID = &id
+		}
+	}
+	for i := range customers {
+		customer := &customers[i]
+		if customer.RateLimitID != nil {
+			if rl := rateLimitByID[*customer.RateLimitID]; rateLimitUnowned(rl) {
+				id := customer.ID
+				rl.CustomerID = &id
+			}
+		}
+		if customer.BudgetID != nil {
+			if b := budgetByID[*customer.BudgetID]; b != nil &&
+				b.VirtualKeyID == nil && b.TeamID == nil && b.CustomerID == nil && b.ProviderConfigID == nil {
+				id := customer.ID
+				b.CustomerID = &id
+			}
+		}
+	}
 }
 
 // collectRateLimitsFromHierarchy collects rate limits and their metadata from the hierarchy (Provider Configs → VK → Team → Customer)
@@ -2349,6 +2555,7 @@ func (gs *LocalGovernanceStore) CreateVirtualKeyInMemory(ctx context.Context, vk
 	// Create associated rate limit if exists
 	if vk.RateLimit != nil {
 		vk.RateLimit.IsCalendarAligned = vk.CalendarAligned
+		stampRateLimitOwner(vk.RateLimit, vk.ID, "", "", nil)
 		gs.rateLimits.Store(vk.RateLimit.ID, vk.RateLimit)
 	}
 
@@ -2362,6 +2569,7 @@ func (gs *LocalGovernanceStore) CreateVirtualKeyInMemory(ctx context.Context, vk
 			}
 			if pc.RateLimit != nil {
 				pc.RateLimit.IsCalendarAligned = vk.CalendarAligned
+				stampRateLimitOwner(pc.RateLimit, "", "", "", &pc.ID)
 				gs.rateLimits.Store(pc.RateLimit.ID, pc.RateLimit)
 			}
 		}
@@ -2452,6 +2660,7 @@ func (gs *LocalGovernanceStore) UpdateVirtualKeyInMemory(ctx context.Context, vk
 				}
 			}
 			clone.RateLimit.IsCalendarAligned = clone.CalendarAligned
+			stampRateLimitOwner(clone.RateLimit, clone.ID, "", "", nil)
 			// Update the rate limit in the main rateLimits sync.Map
 			gs.rateLimits.Store(clone.RateLimit.ID, clone.RateLimit)
 			// Clean up old rate limit if ID changed (e.g., after AP propagation
@@ -2498,6 +2707,7 @@ func (gs *LocalGovernanceStore) UpdateVirtualKeyInMemory(ctx context.Context, vk
 						}
 					}
 					clone.ProviderConfigs[i].RateLimit.IsCalendarAligned = clone.CalendarAligned
+					stampRateLimitOwner(clone.ProviderConfigs[i].RateLimit, "", "", "", &clone.ProviderConfigs[i].ID)
 					gs.rateLimits.Store(clone.ProviderConfigs[i].RateLimit.ID, clone.ProviderConfigs[i].RateLimit)
 				} else {
 					// Rate limit was removed from provider config, delete it from memory if it existed
@@ -2611,6 +2821,7 @@ func (gs *LocalGovernanceStore) CreateTeamInMemory(ctx context.Context, team *co
 	// Create associated rate limit if exists
 	if team.RateLimit != nil {
 		team.RateLimit.IsCalendarAligned = team.CalendarAligned
+		stampRateLimitOwner(team.RateLimit, "", team.ID, "", nil)
 		gs.rateLimits.Store(team.RateLimit.ID, team.RateLimit)
 	}
 
@@ -2673,6 +2884,7 @@ func (gs *LocalGovernanceStore) UpdateTeamInMemory(ctx context.Context, team *co
 				}
 			}
 			clone.RateLimit.IsCalendarAligned = clone.CalendarAligned
+			stampRateLimitOwner(clone.RateLimit, "", clone.ID, "", nil)
 			gs.rateLimits.Store(clone.RateLimit.ID, clone.RateLimit)
 			// Clean up old rate limit if ID changed (e.g., UUID rotation on propagation)
 			if existingTeam.RateLimit != nil && existingTeam.RateLimit.ID != clone.RateLimit.ID {
@@ -2735,10 +2947,12 @@ func (gs *LocalGovernanceStore) CreateCustomerInMemory(ctx context.Context, cust
 	}
 	// Create associated budget if exists
 	if customer.Budget != nil {
+		stampBudgetCustomerOwner(customer.Budget, customer.ID)
 		gs.budgets.Store(customer.Budget.ID, customer.Budget)
 	}
 	// Create associated rate limit if exists
 	if customer.RateLimit != nil {
+		stampRateLimitOwner(customer.RateLimit, "", "", customer.ID, nil)
 		gs.rateLimits.Store(customer.RateLimit.ID, customer.RateLimit)
 	}
 	gs.customers.Store(customer.ID, customer)
@@ -2768,6 +2982,7 @@ func (gs *LocalGovernanceStore) UpdateCustomerInMemory(ctx context.Context, cust
 					clone.Budget.LastReset = existingBudget.LastReset
 				}
 			}
+			stampBudgetCustomerOwner(clone.Budget, clone.ID)
 			gs.budgets.Store(clone.Budget.ID, clone.Budget)
 			// Clean up old budget if ID changed (e.g., UUID rotation on propagation)
 			if existingCustomer.Budget != nil && existingCustomer.Budget.ID != clone.Budget.ID {
@@ -2790,6 +3005,7 @@ func (gs *LocalGovernanceStore) UpdateCustomerInMemory(ctx context.Context, cust
 					clone.RateLimit.RequestLastReset = existingRateLimit.RequestLastReset
 				}
 			}
+			stampRateLimitOwner(clone.RateLimit, "", "", clone.ID, nil)
 			gs.rateLimits.Store(clone.RateLimit.ID, clone.RateLimit)
 			// Clean up old rate limit if ID changed (e.g., UUID rotation on propagation)
 			if existingCustomer.RateLimit != nil && existingCustomer.RateLimit.ID != clone.RateLimit.ID {

@@ -753,6 +753,17 @@ func (h *GovernanceHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
 				if err := h.configStore.CreateVirtualKeyProviderConfig(ctx, providerConfig, tx); err != nil {
 					return err
 				}
+				// Stamp rate limit with provider config ID so ownerScopeFromRateLimit returns "provider"
+				if providerConfig.RateLimitID != nil {
+					var rl configstoreTables.TableRateLimit
+					if err := tx.First(&rl, "id = ?", *providerConfig.RateLimitID).Error; err != nil {
+						return err
+					}
+					rl.ProviderConfigID = &providerConfig.ID
+					if err := tx.Save(&rl).Error; err != nil {
+						return err
+					}
+				}
 				// Create multi-budgets for provider config
 				if len(pc.Budgets) > 0 {
 					seenDurations := make(map[string]bool)
@@ -1159,6 +1170,17 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 					}
 					if err := h.configStore.CreateVirtualKeyProviderConfig(ctx, providerConfig, tx); err != nil {
 						return err
+					}
+					// Stamp rate limit with provider config ID so ownerScopeFromRateLimit returns "provider"
+					if providerConfig.RateLimitID != nil {
+						var rl configstoreTables.TableRateLimit
+						if err := tx.First(&rl, "id = ?", *providerConfig.RateLimitID).Error; err != nil {
+							return err
+						}
+						rl.ProviderConfigID = &providerConfig.ID
+						if err := tx.Save(&rl).Error; err != nil {
+							return err
+						}
 					}
 					// Create multi-budgets for new provider config in update
 					if len(pc.Budgets) > 0 {
