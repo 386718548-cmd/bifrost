@@ -799,7 +799,7 @@ func (h *CompletionHandler) listModels(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusBadRequest, "Failed to convert context")
 		return
 	}
-	if provider == "" && !h.applyListModelsVirtualKeyProviderFilter(ctx, bifrostCtx) {
+	if provider == "" {
 		return
 	}
 
