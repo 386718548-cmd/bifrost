@@ -13,16 +13,7 @@ func (resp *OpenAIResponsesRequest) ToBifrostResponsesRequest(ctx *schemas.Bifro
 		return nil
 	}
 
-	defaultProvider := schemas.OpenAI
-
-	// for requests coming from azure sdk without provider prefix, we need to set the default provider to azure
-	if ctx != nil {
-		if isAzureUser, ok := ctx.Value(schemas.BifrostContextKeyIsAzureUserAgent).(bool); ok && isAzureUser {
-			defaultProvider = schemas.Azure
-		}
-	}
-
-	provider, model := schemas.ParseModelString(resp.Model, utils.CheckAndSetDefaultProvider(ctx, defaultProvider))
+	provider, model := schemas.ParseModelString(resp.Model, "")
 
 	input := resp.Input.OpenAIResponsesRequestInputArray
 	if len(input) == 0 {
