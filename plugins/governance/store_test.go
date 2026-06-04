@@ -66,6 +66,35 @@ func TestGovernanceStore_GetVirtualKey(t *testing.T) {
 	}
 }
 
+// TestGovernanceStore_GetVirtualKeyByID tests lock-free VK ID retrieval.
+func TestGovernanceStore_GetVirtualKeyByID(t *testing.T) {
+	logger := NewMockLogger()
+	store, err := NewLocalGovernanceStore(context.Background(), logger, nil, &configstore.GovernanceConfig{
+		VirtualKeys: []configstoreTables.TableVirtualKey{
+			*buildVirtualKey("vk1", "sk-bf-test1", "Test VK 1", true),
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	vk, exists := store.GetVirtualKeyByID(context.Background(), "vk1")
+	require.True(t, exists)
+	require.NotNil(t, vk)
+	assert.Equal(t, "sk-bf-test1", vk.Value)
+
+	updated := *buildVirtualKey("vk1", "sk-bf-test2", "Test VK 1", true)
+	store.UpdateVirtualKeyInMemory(context.Background(), &updated, nil, nil, nil)
+
+	vk, exists = store.GetVirtualKeyByID(context.Background(), "vk1")
+	require.True(t, exists)
+	require.NotNil(t, vk)
+	assert.Equal(t, "sk-bf-test2", vk.Value)
+
+	store.DeleteVirtualKeyInMemory(context.Background(), "vk1")
+	vk, exists = store.GetVirtualKeyByID(context.Background(), "vk1")
+	assert.False(t, exists)
+	assert.Nil(t, vk)
+}
+
 // TestGovernanceStore_ConcurrentReads tests lock-free concurrent reads
 func TestGovernanceStore_ConcurrentReads(t *testing.T) {
 	logger := NewMockLogger()
@@ -1207,9 +1236,9 @@ func TestGovernanceStore_Customer_CalendarAligned_CreateInMemory(t *testing.T) {
 		LastReset:     time.Now(),
 	}
 	rl := &configstoreTables.TableRateLimit{
-		ID:              rlID,
-		TokenMaxLimit:   ptrInt64(1000),
-		TokenLastReset:  time.Now(),
+		ID:               rlID,
+		TokenMaxLimit:    ptrInt64(1000),
+		TokenLastReset:   time.Now(),
 		RequestLastReset: time.Now(),
 	}
 	customer := buildCustomer("cust-1", "ACME", budget)
@@ -1273,9 +1302,9 @@ func TestGovernanceStore_Customer_CalendarAligned_UpdateInMemory(t *testing.T) {
 		LastReset:     time.Now(),
 	}
 	rl := &configstoreTables.TableRateLimit{
-		ID:              rlID,
-		TokenMaxLimit:   ptrInt64(500),
-		TokenLastReset:  time.Now(),
+		ID:               rlID,
+		TokenMaxLimit:    ptrInt64(500),
+		TokenLastReset:   time.Now(),
 		RequestLastReset: time.Now(),
 	}
 	customer := buildCustomer("cust-3", "Initech", budget)
