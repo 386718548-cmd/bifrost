@@ -279,6 +279,7 @@ type InitialLogData struct {
 	RoutingEngineUsed      []string
 	Metadata               map[string]any
 	PassthroughRequestBody string // Raw body for passthrough requests (UTF-8)
+	UserAgent              string // Raw HTTP User-Agent of the calling client; mapped to a client app in the UI
 }
 
 // LogCallback is a function that gets called when a new log entry is created
@@ -452,6 +453,18 @@ func (p *LoggerPlugin) HTTPTransportStreamChunkHook(ctx *schemas.BifrostContext,
 	return chunk, nil
 }
 
+// userAgentFromContext returns the raw HTTP User-Agent of the calling client from
+// the request header map, or "" when absent. Keys in the map are lowercased, so
+// the lookup is case-insensitive. The value is stored verbatim on the log entry;
+// mapping it to a client app happens in the UI.
+func userAgentFromContext(ctx *schemas.BifrostContext) string {
+	allHeaders, _ := ctx.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
+	if allHeaders == nil {
+		return ""
+	}
+	return allHeaders["user-agent"]
+}
+
 // captureLoggingHeaders extracts configured logging headers and x-bf-lh-* prefixed headers
 // from the request context. Returns a new metadata map, or nil if no headers were captured.
 // System entries (e.g. isAsyncRequest) should be set AFTER calling this so they take precedence.
@@ -549,6 +562,10 @@ func (p *LoggerPlugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifr
 	if req.RequestType == schemas.RealtimeRequest {
 		initialData.Object = "realtime.turn"
 	}
+
+	// Capture the raw User-Agent of the calling client (stored verbatim; the UI
+	// maps it to a client app such as Claude Code, Codex, or Cursor).
+	initialData.UserAgent = userAgentFromContext(ctx)
 
 	if p.contentLoggingEnabled(ctx) {
 		inputHistory, responsesInputHistory := p.extractInputHistory(req)
@@ -1368,6 +1385,12 @@ func (p *LoggerPlugin) PreMCPHook(ctx *schemas.BifrostContext, req *schemas.Bifr
 		entry.VirtualKeyName = &virtualKeyName
 	}
 	applyMCPGovernanceFieldsToEntry(ctx, entry)
+
+	// Capture the raw User-Agent of the calling client (stored verbatim; the UI
+	// maps it to a client app such as Claude Code, Codex, or Cursor).
+	if ua := userAgentFromContext(ctx); ua != "" {
+		entry.UserAgent = &ua
+	}
 
 	// Set arguments if content logging is enabled
 	if p.contentLoggingEnabled(ctx) {

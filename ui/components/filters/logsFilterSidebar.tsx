@@ -4,7 +4,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scrollArea";
 import { Skeleton } from "@/components/ui/skeleton";
-import { RequestTypeLabels, RequestTypes, RoutingEngineUsedLabels, Statuses } from "@/lib/constants/logs";
+import { mapUserAgentToApp, RequestTypeLabels, RequestTypes, RoutingEngineUsedLabels, Statuses } from "@/lib/constants/logs";
 import { useGetAvailableFilterDataQuery, useGetProvidersQuery } from "@/lib/store";
 import type { LogFilters } from "@/lib/types/logs";
 import { cn } from "@/lib/utils";
@@ -111,6 +111,7 @@ export function LogsFilterSidebar({ filters, onFiltersChange }: LogsSidebarProps
 					<SelectedKeysFilter filters={filters} onFiltersChange={onFiltersChange} />
 					<VirtualKeysFilter filters={filters} onFiltersChange={onFiltersChange} />
 					<ProvidersFilter filters={filters} onFiltersChange={onFiltersChange} />
+					<AppFilter filters={filters} onFiltersChange={onFiltersChange} />
 					<TypeFilter filters={filters} onFiltersChange={onFiltersChange} />
 					<AliasesFilter filters={filters} onFiltersChange={onFiltersChange} />
 					<RoutingEnginesFilter filters={filters} onFiltersChange={onFiltersChange} />
@@ -418,6 +419,65 @@ function StopReasonFilter({ filters, onFiltersChange, defaultOpen }: FilterCompo
 				onSearch={setSearchQuery}
 				fetching={isFetching}
 				testIdPrefix="stop-reason-filter"
+			/>
+		</FilterSection>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// AppFilter – groups raw User-Agents into client apps (UI-side mapping)
+// ---------------------------------------------------------------------------
+
+function AppFilter({ filters, onFiltersChange, defaultOpen }: FilterComponentProps) {
+	const hasActive = (filters.user_agents || []).length > 0;
+	const [opened, setOpened] = useState(defaultOpen || hasActive);
+	const searchInputRef = useAutoFocusOnOpen(opened);
+	const {
+		data: filterData,
+		isUninitialized,
+		isLoading,
+	} = useGetAvailableFilterDataQuery({ dimensions: ["user_agents"] }, { skip: !opened && !hasActive });
+	const availableUserAgents = useMemo(() => (filterData?.user_agents as string[] | undefined) || [], [filterData]);
+
+	// Map each raw UA to a client app and group the UAs by app display name. The
+	// dropdown lists apps; toggling an app selects/clears all of its raw UAs.
+	// Currently-selected UAs are folded in so an active chip survives a refetch.
+	const { appToUserAgents, items } = useMemo(() => {
+		const all = [...new Set([...availableUserAgents, ...(filters.user_agents || [])])];
+		const appToUserAgents = new Map<string, string[]>();
+		for (const ua of all) {
+			const appName = mapUserAgentToApp(ua).name;
+			appToUserAgents.set(appName, [...(appToUserAgents.get(appName) || []), ua]);
+		}
+		const items = [...appToUserAgents.keys()].sort().map((name) => ({ key: name, label: name }));
+		return { appToUserAgents, items };
+	}, [availableUserAgents, filters.user_agents]);
+
+	if (!isUninitialized && !isLoading && availableUserAgents.length === 0 && !hasActive && !opened) return null;
+
+	const selectedSet = new Set(filters.user_agents || []);
+
+	return (
+		<FilterSection
+			title="App"
+			defaultOpen={defaultOpen || hasActive}
+			loading={isLoading}
+			onOpenChange={setOpened}
+			testId="app-filter-toggle"
+		>
+			<SearchableCheckboxList
+				inputRef={searchInputRef}
+				placeholder="Search apps"
+				items={items}
+				isSelected={(appName) => (appToUserAgents.get(appName) || []).some((ua) => selectedSet.has(ua))}
+				onToggle={(appName) => {
+					const uas = appToUserAgents.get(appName) || [];
+					const current = filters.user_agents || [];
+					const anySelected = uas.some((ua) => current.includes(ua));
+					const next = anySelected ? current.filter((ua) => !uas.includes(ua)) : [...current, ...uas.filter((ua) => !current.includes(ua))];
+					onFiltersChange({ ...filters, user_agents: next.length > 0 ? next : undefined });
+				}}
+				testIdPrefix="app-filter"
 			/>
 		</FilterSection>
 	);

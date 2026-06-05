@@ -37,6 +37,7 @@ SELECT
     COALESCE(team_id, '') AS team_id,
     COALESCE(customer_id, '') AS customer_id,
     COALESCE(business_unit_id, '') AS business_unit_id,
+    COALESCE(user_agent, '') AS user_agent,
     COUNT(*) AS count,
     SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
     SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count,
@@ -51,7 +52,7 @@ SELECT
     COALESCE(SUM(cost), 0) AS total_cost
 FROM logs
 WHERE status IN ('success', 'error')
-GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
 `
 
 // mvLogsHourlyUniqueIdx is required for REFRESH MATERIALIZED VIEW CONCURRENTLY.
@@ -59,7 +60,7 @@ GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
 // during startup ensure / repair paths.
 const mvLogsHourlyUniqueIdx = `
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS mv_logs_hourly_uniq
-ON mv_logs_hourly (hour, provider, model, status, object_type, selected_key_id, virtual_key_id, routing_rule_id, user_id, team_id, customer_id, business_unit_id)
+ON mv_logs_hourly (hour, provider, model, status, object_type, selected_key_id, virtual_key_id, routing_rule_id, user_id, team_id, customer_id, business_unit_id, user_agent)
 `
 
 // mvLogsHourlyRequiredColumns is the canonical column set used by
@@ -78,6 +79,7 @@ var mvLogsHourlyRequiredColumns = []string{
 	"team_id",
 	"customer_id",
 	"business_unit_id",
+	"user_agent",
 }
 
 // legacyMatViewNames are matviews from previous schema versions that no longer
@@ -219,9 +221,9 @@ var filterMatViews = []filterMatViewDef{
 		requiredColumns: append([]string{"id", "name"}, scopeRequiredColumns...),
 	},
 	{
-		name:       "mv_filter_users",
-		selectExpr: "user_id AS id, user_name AS name, " + scopeProjection,
-		whereExpr:  "user_id IS NOT NULL AND user_id != '' AND user_name IS NOT NULL AND user_name != ''",
+		name:            "mv_filter_users",
+		selectExpr:      "user_id AS id, user_name AS name, " + scopeProjection,
+		whereExpr:       "user_id IS NOT NULL AND user_id != '' AND user_name IS NOT NULL AND user_name != ''",
 		uniqueIdx:       "id, name, " + scopeIdxColumns,
 		requiredColumns: append([]string{"id", "name"}, scopeRequiredColumns...),
 	},
@@ -231,6 +233,16 @@ var filterMatViews = []filterMatViewDef{
 		whereExpr:       "business_unit_id IS NOT NULL AND business_unit_id != '' AND business_unit_name IS NOT NULL AND business_unit_name != ''",
 		uniqueIdx:       "id, name, " + scopeIdxColumns,
 		requiredColumns: append([]string{"id", "name"}, scopeRequiredColumns...),
+	},
+	{
+		// Distinct raw User-Agent strings for the logs "App" filter dropdown.
+		// The UI maps each raw UA to a client app (Claude Code, Codex, Cursor, ...)
+		// and expands a selected app back to its matching UA strings for filtering.
+		name:            "mv_filter_user_agents",
+		selectExpr:      "user_agent, " + scopeProjection,
+		whereExpr:       "user_agent IS NOT NULL AND user_agent != ''",
+		uniqueIdx:       "user_agent, " + scopeIdxColumns,
+		requiredColumns: append([]string{"user_agent"}, scopeRequiredColumns...),
 	},
 }
 
@@ -242,7 +254,7 @@ var filterMatViewKeyPairColumns = map[[2]string]string{
 	{"routing_rule_id", "routing_rule_name"}:   "mv_filter_routing_rules",
 	{"team_id", "team_name"}:                   "mv_filter_teams",
 	{"customer_id", "customer_name"}:           "mv_filter_customers",
-	{"user_id", "user_name"}:                    "mv_filter_users",
+	{"user_id", "user_name"}:                   "mv_filter_users",
 	{"business_unit_id", "business_unit_name"}: "mv_filter_business_units",
 }
 
@@ -833,6 +845,9 @@ func applyMatViewFiltersOnly(q *gorm.DB, f SearchFilters) *gorm.DB {
 	}
 	if len(f.BusinessUnitIDs) > 0 {
 		q = q.Where("business_unit_id IN ?", f.BusinessUnitIDs)
+	}
+	if len(f.UserAgents) > 0 {
+		q = q.Where("user_agent IN ?", f.UserAgents)
 	}
 	return q
 }
@@ -1738,10 +1753,10 @@ func (s *RDBLogStore) getDimensionRankingsFromMatView(ctx context.Context, filte
 	}
 
 	type row struct {
-		ID         string  `gorm:"column:id"`
-		Total      int64   `gorm:"column:total"`
-		TotalTkns  int64   `gorm:"column:total_tkns"`
-		TotalCost  float64 `gorm:"column:total_cost"`
+		ID        string  `gorm:"column:id"`
+		Total     int64   `gorm:"column:total"`
+		TotalTkns int64   `gorm:"column:total_tkns"`
+		TotalCost float64 `gorm:"column:total_cost"`
 	}
 
 	var results []row
@@ -1882,6 +1897,21 @@ func (s *RDBLogStore) getDistinctStopReasonsFromMatView(ctx context.Context, lim
 		return nil, err
 	}
 	return stopReasons, nil
+}
+
+// getDistinctUserAgentsFromMatView returns unique raw User-Agent strings from mv_filter_user_agents.
+func (s *RDBLogStore) getDistinctUserAgentsFromMatView(ctx context.Context, limit int, query string) ([]string, error) {
+	var userAgents []string
+	q := s.ScopedDB(ctx).Table("mv_filter_user_agents").
+		Distinct("user_agent").
+		Where("user_agent != ''")
+	if query != "" {
+		q = q.Where("user_agent ILIKE ?", "%"+query+"%")
+	}
+	if err := q.Order("user_agent ASC").Limit(limit).Pluck("user_agent", &userAgents).Error; err != nil {
+		return nil, err
+	}
+	return userAgents, nil
 }
 
 // getDistinctKeyPairsFromMatView returns unique ID-Name pairs for the given

@@ -55,6 +55,10 @@ func (p *LoggerPlugin) insertInitialLogEntry(
 	if parentRequestID != "" {
 		entry.ParentRequestID = &parentRequestID
 	}
+	if data.UserAgent != "" {
+		ua := data.UserAgent
+		entry.UserAgent = &ua
+	}
 	return p.store.CreateIfNotExists(ctx, entry)
 }
 
@@ -1149,6 +1153,16 @@ func (p *LoggerPlugin) GetAvailableStopReasons(ctx context.Context, limit int, q
 		return nil, fmt.Errorf("failed to get available stop reasons: %w", err)
 	}
 	return stopReasons, nil
+}
+
+// GetAvailableUserAgents returns all unique raw User-Agent strings from logs.
+// The UI maps each to a client app. Uses DISTINCT to avoid loading all rows.
+func (p *LoggerPlugin) GetAvailableUserAgents(ctx context.Context, limit int, query string) ([]string, error) {
+	userAgents, err := p.store.GetDistinctUserAgents(ctx, limit, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get available user agents: %w", err)
+	}
+	return userAgents, nil
 }
 
 // keyPairResultsToKeyPairs converts logstore.KeyPairResult slice to KeyPair slice
